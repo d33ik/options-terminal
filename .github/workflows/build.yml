@@ -1,0 +1,81 @@
+name: Build dashboards
+
+on:
+  schedule:
+    # Час у UTC. Влітку Варшава = UTC+2, узимку UTC+1.
+    #   06:00 UTC ≈ 08:00 ранку  — свіжий settled OI за минулу сесію США
+    #   17:00 UTC ≈ 19:00 вечора — Eurex уже опублікував DAX, США торгують
+    # GitHub може запустити із запізненням до години — це нормально.
+    - cron: "0 6,17 * * 1-6"
+  workflow_dispatch:        # кнопка «запустити зараз» вручну
+
+permissions:
+  contents: write           # щоб комітити базу назад
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Встановити залежності
+        run: pip install -r requirements.txt
+
+      - name: Зібрати DAX
+        env:
+          OPTIONS_HEADLESS: "1"
+          OPTIONS_OUT_DIR: site
+        run: python visualize.py
+        continue-on-error: true      # збій Eurex не має валити збірку США
+
+      - name: Зібрати SPX / NDX
+        env:
+          OPTIONS_HEADLESS: "1"
+          OPTIONS_OUT_DIR: site
+        run: python visualize_us.py
+        continue-on-error: true
+
+      - name: Титульна сторінка
+        env:
+          OPTIONS_OUT_DIR: site
+        run: python make_index.py
+
+      - name: Перевірити, що щось зібралось
+        run: |
+          ls -lh site/
+          test -f site/index.html
+          # хоча б один дашборд має бути на місці
+          test -f site/dax_options.html || test -f site/us_options.html
+
+      - name: Зберегти бази для Δ OI
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f options_data.db us_options.db 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "дані $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push || echo "нема чого пушити"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
