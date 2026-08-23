@@ -32,6 +32,24 @@ jobs:
       - name: Встановити залежності
         run: pip install -r requirements.txt
 
+      - name: Перевірити комплектність проєкту
+        run: |
+          missing=""
+          for f in visualize.py visualize_us.py make_index.py \
+                   src/analytics.py src/black76.py src/cboe_provider.py \
+                   src/database.py src/eurex_provider.py src/futures_price.py \
+                   src/gex.py src/models.py; do
+            [ -f "$f" ] || missing="$missing\n  $f"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::У репозиторії бракує файлів:"
+            printf "$missing\n"
+            echo ""
+            echo "Завантаж їх через Add file → Upload files, зберігаючи структуру папок."
+            exit 1
+          fi
+          echo "Усі файли на місці."
+
       - name: Зібрати DAX
         env:
           OPTIONS_HEADLESS: "1"
