@@ -1,0 +1,7 @@
+# Залежності обох терміналів
+# Встановлення:  pip install -r requirements.txt
+
+requests>=2.31.0        # запити до Eurex та Cboe
+plotly>=5.20.0          # інтерактивні графіки
+yfinance>=0.2.40        # spot Xetra DAX (потрібен лише для DAX)
+python-dateutil>=2.9.0  # горизонт expiry для heatmap
