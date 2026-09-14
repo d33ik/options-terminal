@@ -75,10 +75,33 @@ def _filter(rows, center, p=ZOOM + 0.03):
     keep = [r for r in rows if lo <= r["strike"] <= hi]
     return keep if len(keep) >= 5 else rows
 
-def _bar_width(xs):
-    if len(xs) < 2:
-        return 5
-    return sorted({round(xs[i + 1] - xs[i]) for i in range(len(xs) - 1)})[0] * 0.82
+def _bar_width(xs, frac=0.88):
+    """
+    Ширина кожного бару окремо, за відстанню до найближчого сусіда.
+
+    Сітка страйків нерівномірна: біля грошей крок 5 пунктів, далі 25, ще
+    далі 50. Якщо взяти один мінімальний крок на весь графік (як було),
+    у розріджених зонах бар займає 4 пункти зі слоту в 50 — виходять
+    тонкі риски серед порожнечі. Саме тому SPX читався гірше за DAX,
+    у якого сітка рівна.
+
+    Повертає список — Plotly приймає width як масив.
+    """
+    n = len(xs)
+    if n == 0:
+        return []
+    if n == 1:
+        return [5]
+    out = []
+    for i, x in enumerate(xs):
+        gaps = []
+        if i > 0:
+            gaps.append(x - xs[i - 1])
+        if i < n - 1:
+            gaps.append(xs[i + 1] - x)
+        # беремо найменший із сусідніх проміжків, щоб бари не налазили
+        out.append(min(g for g in gaps if g > 0) * frac)
+    return out
 
 def _nice(x: float) -> int:
     """Округлення вгору до «читабельного» числа: 1, 1.5, 2, 2.5, 3, 4, 5, 7.5."""
@@ -165,7 +188,7 @@ def build_figure(series: list[dict]) -> go.Figure:
             for g in grows
         ]
         fig.add_trace(go.Bar(
-            x=gx, y=gy, width=(_bar_width(gx) if gx else 5),
+            x=gx, y=gy, width=_bar_width(gx),
             name="GEX", visible=False, showlegend=False, marker_line_width=0,
             marker_color=[GEX_POS if v >= 0 else GEX_NEG for v in gy],
             customdata=giv,
@@ -330,6 +353,14 @@ def build_meta(series: list[dict]) -> list[dict]:
         c_vol = sum(r["call_vol"] or 0 for r in rows)
         p_vol = sum(r["put_vol"]  or 0 for r in rows)
 
+        # Коефіцієнти рахуємо ТУТ, із тих самих rows, що дали суми вище.
+        # Раніше бралось збережене s["pcr"], пораховане по ВСЬОМУ ланцюгу,
+        # тоді як суми під плиткою — з видимого вікна ±10%. Через далекі
+        # путові хвости число розходилось із надрукованим поруч і майже
+        # не змінювалось між оновленнями.
+        pc_oi  = f"{p_oi / c_oi:.2f}"   if c_oi  else "—"
+        pc_vol = f"{p_vol / c_vol:.2f}" if c_vol else "—"
+
         prev   = s["prev"]
         d_call = sum(r["call_oi"] - prev[r["strike"]]["call_oi"]
                      for r in rows if r["strike"] in prev) if prev else 0
@@ -353,8 +384,8 @@ def build_meta(series: list[dict]) -> list[dict]:
             pain_txt   = _sp(mp),
             pull_txt   = pull,
             pull_dir   = direction,
-            pcr        = f"{s['pcr']:.2f}" if s["pcr"] else "—",
-            vol_pc     = f"{p_vol / c_vol:.2f}" if c_vol else "—",
+            pcr        = pc_oi,
+            vol_pc     = pc_vol,
             gex_txt    = (f"{total_gex:+.2f}B" if total_gex is not None else "—"),
             gex_dir    = ("up" if (total_gex or 0) >= 0 else "down"),
             stamp      = s["stamp"],
