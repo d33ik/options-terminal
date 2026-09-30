@@ -1,20 +1,19 @@
 """
 US Index Options Terminal — SPX та NDX.
 
-Запуск:  python visualize_us.py   (або подвійний клік на запустити-us.bat)
+Запуск:  python visualize_us.py   (або подвійний клік на запустити-US.bat)
 
 Дані: публічний фід Cboe (безкоштовний, без ключа, затримка ~15 хв).
 База: us_options.db — окремо від DAX, нічого не перемішується.
 """
 
-import sys, logging, webbrowser, json
+import sys, logging, webbrowser, json, os
 from pathlib import Path
 from datetime import date
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 import database
 database.DB_PATH = Path(__file__).parent / "us_options.db"   # окрема база
@@ -31,20 +30,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datef
 # ─────────────────────────────────────────────────────────────────────────────
 # Режим сервера. Локально нічого не змінюється — усе вмикається змінними
 # оточення, які виставляє тільки GitHub Actions.
-#   OPTIONS_OUT_DIR  куди класти HTML (за замовчуванням — папка скрипта)
-#   OPTIONS_HEADLESS не відкривати браузер + Plotly з CDN замість вшитого
 # ─────────────────────────────────────────────────────────────────────────────
-import os
-
-HEADLESS = bool(os.environ.get("OPTIONS_HEADLESS"))
-OUT_DIR  = Path(os.environ.get("OPTIONS_OUT_DIR") or Path(__file__).parent)
-# Вшитий Plotly (~5 МБ) потрібен лише щоб файл відкривався офлайн.
-# На хостингу сторінка й так вантажиться з мережі — беремо CDN і 0.6 МБ.
+HEADLESS  = bool(os.environ.get("OPTIONS_HEADLESS"))
+OUT_DIR   = Path(os.environ.get("OPTIONS_OUT_DIR") or Path(__file__).parent)
 PLOTLY_JS = "cdn" if HEADLESS else True
 
-
-
-# ── Палітра (та сама мова, що й у DAX-терміналі) ─────────────────────────────
+# ── Палітра ──────────────────────────────────────────────────────────────────
 VOID, SURFACE, RULE = "#000000", "#0A0A0B", "#1A1A1D"
 CHALK, ASH          = "#FFFFFF", "#6E6E76"     # puts / calls
 SPOT_C, PAIN_C      = "#22D3EE", "#E8A317"
@@ -53,58 +44,96 @@ D_OPEN, D_CLOSE     = "#2DD4A7", "#FB7185"
 TEXT, MUTED, FAINT  = "#E8E8EA", "#6E6E76", "#45454C"
 
 ASSETS       = ["SPX", "NDX"]
-MAX_EXPIRIES = 10        # у SPX експірації щоденні — без ліміту HTML роздувається
-ZOOM         = 0.10      # ±10 %: у US-індексів страйки густіші, ніж у DAX
+MAX_EXPIRIES = 10
 SEPARATORS   = ". "
-
 MONO = "'IBM Plex Mono', ui-monospace, 'SF Mono', Consolas, monospace"
 
-TRACES_PER_SERIES = 7    # call_oi, put_oi, call_vol, put_vol, gex, d_call, d_put
+# Скільки страйків тримати в наборі та скільки показувати одразу.
+# Рахуємо у СТРАЙКАХ, а не у відсотках: сітка нерівномірна (біля грошей
+# крок 5, далі 25 і 50), тож «±10 %» давало то 40 барів, то 300.
+KEEP_STRIKES = 140    # лишаємо в даних — решта доступна скролом
+VIEW_STRIKES = 46     # видно одразу; вужче вікно = читабельніші бари
+
+TRACES_PER_SERIES = 7  # call_oi, put_oi, call_vol, put_vol, gex, d_call, d_put
 
 
 def _sp(v, f=",.0f"):
-    return f"{v:{f}}".replace(",", "\u2009") if v is not None else "—"
+    return f"{v:{f}}".replace(",", " ") if v is not None else "—"
 
-def _xrange(c, p=ZOOM):
-    return [c * (1 - p), c * (1 + p)] if c else None
 
-def _filter(rows, center, p=ZOOM + 0.03):
-    if not center:
-        return rows
-    lo, hi = center * (1 - p), center * (1 + p)
-    keep = [r for r in rows if lo <= r["strike"] <= hi]
-    return keep if len(keep) >= 5 else rows
-
-def _bar_width(xs, frac=0.88):
+def _window(rows, center, keep=KEEP_STRIKES):
     """
-    Ширина кожного бару окремо, за відстанню до найближчого сусіда.
+    Лишає `keep` страйків, найближчих до центру, у порядку зростання.
 
-    Сітка страйків нерівномірна: біля грошей крок 5 пунктів, далі 25, ще
-    далі 50. Якщо взяти один мінімальний крок на весь графік (як було),
-    у розріджених зонах бар займає 4 пункти зі слоту в 50 — виходять
-    тонкі риски серед порожнечі. Саме тому SPX читався гірше за DAX,
-    у якого сітка рівна.
-
-    Повертає список — Plotly приймає width як масив.
+    Рахуємо в кількості страйків, а не у відсотках від ціни: у SPX біля
+    грошей сітка з кроком 5, далі 25 і 50, тому однаковий відсоток давав
+    зовсім різну щільність барів на різних експіраціях.
     """
-    n = len(xs)
-    if n == 0:
+    if not rows:
         return []
-    if n == 1:
-        return [5]
-    out = []
-    for i, x in enumerate(xs):
-        gaps = []
-        if i > 0:
-            gaps.append(x - xs[i - 1])
-        if i < n - 1:
-            gaps.append(xs[i + 1] - x)
-        # беремо найменший із сусідніх проміжків, щоб бари не налазили
-        out.append(min(g for g in gaps if g > 0) * frac)
-    return out
+    if not center:
+        return sorted(rows, key=lambda r: r["strike"])[:keep]
+    near = sorted(rows, key=lambda r: abs(r["strike"] - center))[:keep]
+    return sorted(near, key=lambda r: r["strike"])
 
-def _nice(x: float) -> int:
-    """Округлення вгору до «читабельного» числа: 1, 1.5, 2, 2.5, 3, 4, 5, 7.5."""
+
+def _cat_pos(strikes, value):
+    """
+    Позиція ціни на КАТЕГОРІАЛЬНІЙ осі — дробовий індекс між страйками.
+
+    Категоріальна вісь робить усі бари однакової ширини (саме цього
+    бракувало: на числовій осі бар отримував ширину з кроку сітки, тож
+    у рідких зонах виходили широкі плити, а в густих — тонкі риски).
+    Платою є те, що вертикальні лінії spot і max pain більше не можна
+    поставити за значенням — їх позицію доводиться рахувати самому.
+    """
+    if not strikes or value is None:
+        return None
+    if value <= strikes[0]:
+        return 0.0
+    if value >= strikes[-1]:
+        return float(len(strikes) - 1)
+    for i in range(len(strikes) - 1):
+        lo, hi = strikes[i], strikes[i + 1]
+        if lo <= value <= hi:
+            span = hi - lo
+            return i + ((value - lo) / span if span else 0.0)
+    return float(len(strikes) - 1)
+
+
+def _view_range(strikes, center, width=VIEW_STRIKES):
+    """Видиме вікно в індексах категорій, відцентроване на ціні."""
+    n = len(strikes)
+    if n == 0:
+        return None
+    if n <= width:
+        return [-0.5, n - 0.5]
+    mid = _cat_pos(strikes, center)
+    if mid is None:
+        mid = n / 2
+    half = width / 2
+    lo = max(-0.5, mid - half)
+    hi = min(n - 0.5, lo + width)
+    lo = max(-0.5, hi - width)
+    return [lo, hi]
+
+
+def _ticks(strikes, every=None):
+    """
+    Розріджені підписи осі: категоріальна вісь інакше друкує кожен страйк
+    і мітки зливаються в кашу.
+    """
+    n = len(strikes)
+    if n == 0:
+        return [], []
+    if every is None:
+        every = max(1, round(n / 26))
+    idx = list(range(0, n, every))
+    return idx, [_sp(strikes[i]) for i in idx]
+
+
+def _nice(x):
+    """Округлення вгору до читабельного числа."""
     if x <= 0:
         return 10
     import math
@@ -116,14 +145,10 @@ def _nice(x: float) -> int:
     return int(10 * base)
 
 
-def _cap(values, pct: float = 0.95, mult: float = 1.15, floor: int = 10) -> int:
+def _cap(values, pct=0.97, mult=1.1, floor=10):
     """
-    Стеля осі за перцентилем, а не за максимумом.
-
-    Один-два величезні страйки (далекі хеджі, роловані позиції) інакше
-    розчавлюють шкалу і решта барів перетворюється на писк біля нуля.
-    Викиди нікуди не зникають — вони впираються в стелю, а решту стає
-    видно. Повний розмах доступний скролом.
+    Стеля осі за перцентилем, а не за максимумом: поодинокі величезні
+    страйки інакше розчавлюють решту в писк біля нуля.
     """
     nz = sorted(v for v in values if v and v > 0)
     if not nz:
@@ -133,152 +158,158 @@ def _cap(values, pct: float = 0.95, mult: float = 1.15, floor: int = 10) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Фігура: усі серії (актив × експірація) в одному полотні
+# Головна фігура — ОДНЕ полотно, індексна вісь X
 # ─────────────────────────────────────────────────────────────────────────────
-def build_figure(series: list[dict]) -> go.Figure:
+def build_figure(series):
     """
-    series — плаский список, по одному запису на (актив, експірація).
-    Кожен додає рівно TRACES_PER_SERIES трейсів; базовий індекс кладемо
-    в сам запис, щоб JS не рахував зсуви й не помилявся.
+    Кожна серія додає TRACES_PER_SERIES трейсів:
+      0 call_oi  1 put_oi  2 call_vol  3 put_vol  4 gex  5 d_call  6 d_put
+
+    Вісь X — порядковий номер страйку, а не його значення. Через це всі
+    бари однакової ширини навіть там, де крок сітки стрибає з 5 на 50;
+    реальні страйки показують підписи. Раніше ширину доводилось брати з
+    кроку сітки, і графік виходив із плит упереміш із рисками.
+
+    Полотно одне: Volume переїхав у власну вкладку, тож OI займає всю
+    висоту — на двох панелях бари були вдвічі нижчі й гірше читались.
     """
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        row_heights=[0.62, 0.38], vertical_spacing=0.025)
+    fig = go.Figure()
 
     for i, s in enumerate(series):
         s.setdefault("base", i * TRACES_PER_SERIES)
-        rows   = s["rows"]
-        xs     = [r["strike"] for r in rows]
-        bw     = _bar_width(xs)
-        first  = (i == 0)
-        base   = dict(marker_line_width=0, visible=first, showlegend=False)
+        rows    = s["rows"]
+        strikes = [r["strike"] for r in rows]
+        xs      = list(range(len(rows)))          # 0,1,2… — рівний крок
+        labels  = [_sp(k) for k in strikes]
+        shown   = (i == 0)
+        base    = dict(marker_line_width=0, visible=shown, showlegend=False,
+                       customdata=labels)
 
         fig.add_trace(go.Bar(
-            x=xs, y=[r["call_oi"] for r in rows], width=bw,
-            name="Call OI", marker_color=ASH,
-            hovertemplate="<b>%{x}</b>   Call OI  <b>%{y}</b><extra></extra>", **base,
-        ), row=1, col=1)
-
+            x=xs, y=[r["call_oi"] for r in rows], name="Call OI",
+            marker_color=ASH,
+            hovertemplate="<b>%{customdata}</b>   Call OI  <b>%{y}</b><extra></extra>",
+            **base,
+        ))
         fig.add_trace(go.Bar(
-            x=xs, y=[-r["put_oi"] for r in rows], width=bw,
-            name="Put OI", marker_color=CHALK,
-            customdata=[r["put_oi"] for r in rows],
-            hovertemplate="<b>%{x}</b>   Put OI  <b>%{customdata}</b><extra></extra>", **base,
-        ), row=1, col=1)
-
+            x=xs, y=[-r["put_oi"] for r in rows], name="Put OI",
+            marker_color=CHALK,
+            customdata=[[l, r["put_oi"]] for l, r in zip(labels, rows)],
+            hovertemplate="<b>%{customdata[0]}</b>   Put OI  <b>%{customdata[1]}</b><extra></extra>",
+            **{k: v for k, v in base.items() if k != "customdata"},
+        ))
         fig.add_trace(go.Bar(
-            x=xs, y=[r["call_vol"] or 0 for r in rows], width=bw,
-            name="Call Vol", marker_color=ASH, opacity=0.8,
-            hovertemplate="<b>%{x}</b>   Call Vol  <b>%{y}</b><extra></extra>", **base,
-        ), row=2, col=1)
-
+            x=xs, y=[r["call_vol"] or 0 for r in rows], name="Call Vol",
+            marker_color=ASH, opacity=0.85,
+            hovertemplate="<b>%{customdata}</b>   Call Vol  <b>%{y}</b><extra></extra>",
+            **base,
+        ))
         fig.add_trace(go.Bar(
-            x=xs, y=[-(r["put_vol"] or 0) for r in rows], width=bw,
-            name="Put Vol", marker_color=CHALK, opacity=0.8,
-            customdata=[r["put_vol"] or 0 for r in rows],
-            hovertemplate="<b>%{x}</b>   Put Vol  <b>%{customdata}</b><extra></extra>", **base,
-        ), row=2, col=1)
+            x=xs, y=[-(r["put_vol"] or 0) for r in rows], name="Put Vol",
+            marker_color=CHALK, opacity=0.85,
+            customdata=[[l, r["put_vol"] or 0] for l, r in zip(labels, rows)],
+            hovertemplate="<b>%{customdata[0]}</b>   Put Vol  <b>%{customdata[1]}</b><extra></extra>",
+            **{k: v for k, v in base.items() if k != "customdata"},
+        ))
 
-        # ── GEX: у мільярдах доларів на 1 % руху ────────────────────────────
-        grows = _filter(s["gex"], s["center"]) if s["gex"] else []
-        gx = [g["strike"] for g in grows]
-        gy = [g["gex"] / 1e9 for g in grows]
-        giv = [
-            (f"IV  {g['call_iv']:.1f}% C / {g['put_iv']:.1f}% P"
-             if g["call_iv"] and g["put_iv"] else "")
-            for g in grows
-        ]
+        # ── GEX ──────────────────────────────────────────────────────────────
+        gex_by_strike = {g["strike"]: g for g in s["gex"]} if s["gex"] else {}
+        gy, gtxt = [], []
+        for k, lab in zip(strikes, labels):
+            g = gex_by_strike.get(k)
+            gy.append((g["gex"] / 1e9) if g else 0.0)
+            iv = ""
+            if g and g.get("call_iv") and g.get("put_iv"):
+                iv = f"IV  {g['call_iv']:.1f}% C / {g['put_iv']:.1f}% P"
+            gtxt.append([lab, iv])
         fig.add_trace(go.Bar(
-            x=gx, y=gy, width=_bar_width(gx),
-            name="GEX", visible=False, showlegend=False, marker_line_width=0,
+            x=xs, y=gy, name="GEX",
+            visible=False, showlegend=False, marker_line_width=0,
             marker_color=[GEX_POS if v >= 0 else GEX_NEG for v in gy],
-            customdata=giv,
-            hovertemplate="<b>%{x}</b>   GEX  <b>%{y:.3f}B $</b><br>%{customdata}<extra></extra>",
-        ), row=1, col=1)
+            customdata=gtxt,
+            hovertemplate="<b>%{customdata[0]}</b>   GEX  <b>%{y:.3f}B $</b>"
+                          "<br>%{customdata[1]}<extra></extra>",
+        ))
 
-        # ── Δ OI ────────────────────────────────────────────────────────────
+        # ── Δ OI ─────────────────────────────────────────────────────────────
         prev = s["prev"]
-        dxs, dcall, dput = [], [], []
+        dcall, dput = [], []
         for r in rows:
-            p = prev.get(r["strike"])
-            if p:
-                dxs.append(r["strike"])
-                dcall.append(r["call_oi"] - p["call_oi"])
-                dput.append(-(r["put_oi"] - p["put_oi"]))
+            p = prev.get(r["strike"]) if prev else None
+            dcall.append((r["call_oi"] - p["call_oi"]) if p else 0)
+            dput.append((-(r["put_oi"] - p["put_oi"])) if p else 0)
 
-        if dxs:
-            dbw = _bar_width(dxs)
-            fig.add_trace(go.Bar(
-                x=dxs, y=dcall, width=dbw, name="Δ Call",
-                visible=False, showlegend=False, marker_line_width=0,
-                marker_color=[D_OPEN if v >= 0 else D_CLOSE for v in dcall],
-                hovertemplate="<b>%{x}</b>   Δ Call OI  <b>%{y:+}</b><extra></extra>",
-            ), row=1, col=1)
-            fig.add_trace(go.Bar(
-                x=dxs, y=dput, width=dbw, name="Δ Put",
-                visible=False, showlegend=False, marker_line_width=0,
-                marker_color=[D_CLOSE if v >= 0 else D_OPEN for v in dput],
-                customdata=[-v for v in dput],
-                hovertemplate="<b>%{x}</b>   Δ Put OI  <b>%{customdata:+}</b><extra></extra>",
-            ), row=1, col=1)
-        else:
-            for _ in range(2):
-                fig.add_trace(go.Bar(x=[], y=[], visible=False, showlegend=False,
-                                     marker_line_width=0), row=1, col=1)
+        fig.add_trace(go.Bar(
+            x=xs, y=dcall, name="Δ Call",
+            visible=False, showlegend=False, marker_line_width=0,
+            marker_color=[D_OPEN if v >= 0 else D_CLOSE for v in dcall],
+            customdata=labels,
+            hovertemplate="<b>%{customdata}</b>   Δ Call OI  <b>%{y:+}</b><extra></extra>",
+        ))
+        fig.add_trace(go.Bar(
+            x=xs, y=dput, name="Δ Put",
+            visible=False, showlegend=False, marker_line_width=0,
+            marker_color=[D_CLOSE if v >= 0 else D_OPEN for v in dput],
+            customdata=[[l, -v] for l, v in zip(labels, dput)],
+            hovertemplate="<b>%{customdata[0]}</b>   Δ Put OI  <b>%{customdata[1]:+}</b><extra></extra>",
+        ))
 
     head = series[0]
+
     fig.update_layout(
         paper_bgcolor=VOID, plot_bgcolor=SURFACE,
         font=dict(color=MUTED, family=MONO, size=11),
         separators=SEPARATORS,
-        barmode="overlay", bargap=0.06, showlegend=False,
+        barmode="overlay", bargap=0.26, showlegend=False,
         hovermode="x unified", dragmode="pan",
         hoverlabel=dict(bgcolor="#111114", bordercolor=RULE, align="left",
                         font=dict(color=TEXT, family=MONO, size=12)),
-        height=660, margin=dict(t=30, b=44, l=76, r=16),
-        transition=dict(duration=180, easing="cubic-in-out"),
+        height=620, margin=dict(t=34, b=52, l=76, r=18),
+        # Плавний перехід між станами: Plotly анімує бари й осі замість
+        # миттєвої підміни, тож перемикання читається як рух, не як ривок.
+        transition=dict(duration=340, easing="cubic-in-out"),
     )
 
     spike = dict(showspikes=True, spikecolor="#3A3A42", spikethickness=1,
                  spikedash="solid", spikemode="across", spikesnap="cursor")
-    grid  = dict(gridcolor=RULE, gridwidth=1, zerolinecolor="#2E2E35",
-                 zerolinewidth=1, showline=False,
-                 tickfont=dict(color=FAINT, size=10, family=MONO))
 
-    # X — цілі страйки. Y — БЕЗ ",d": у режимі GEX значення дробові
-    # (мільярди), і цілочисельний формат схлопнув би їх у «0, 0, -1, -1».
-    fig.update_xaxes(**grid, **spike, nticks=16, tickformat=",d")
-    fig.update_yaxes(**grid, **spike, separatethousands=True)
-    fig.update_xaxes(range=head["xrange"])
-    fig.update_yaxes(row=1, col=1, title_text="OPEN INTEREST", title_standoff=10,
-                     title_font=dict(color=FAINT, size=9, family=MONO))
-    fig.update_yaxes(row=1, col=1, range=[-head["oi_put"], head["oi_call"]])
-    fig.update_yaxes(row=2, col=1, title_text="VOLUME", title_standoff=10,
-                     title_font=dict(color=FAINT, size=9, family=MONO),
-                     range=[-head["vol_put"], head["vol_call"]])
+    tickvals, ticktext = _ticks(head["strikes"])
+    fig.update_xaxes(
+        gridcolor=RULE, zerolinecolor="#2E2E35", showline=False,
+        tickfont=dict(color=FAINT, size=10, family=MONO),
+        tickmode="array", tickvals=tickvals, ticktext=ticktext,
+        range=head["view"], **spike,
+    )
+    fig.update_yaxes(
+        gridcolor=RULE, zerolinecolor="#2E2E35", zerolinewidth=1, showline=False,
+        tickfont=dict(color=FAINT, size=10, family=MONO),
+        separatethousands=True, title_standoff=12,
+        title_text="OPEN INTEREST",
+        title_font=dict(color=FAINT, size=9, family=MONO),
+        range=[-head["oi_put"], head["oi_call"]], **spike,
+    )
     return fig
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Heatmap на актив
+# Heatmap: expiry × страйк
 # ─────────────────────────────────────────────────────────────────────────────
-def build_heatmap(series: list[dict]):
+def build_heatmap(series):
     series = [s for s in series if s["rows"]]
     if not series:
         return None
 
     center = series[0]["center"]
-    lo = center * (1 - ZOOM - 0.02) if center else 0
-    hi = center * (1 + ZOOM + 0.02) if center else 10 ** 9
-
-    strikes = sorted({r["strike"] for s in series for r in s["rows"]
-                      if lo <= r["strike"] <= hi})
-    if not strikes:
+    pool = sorted({r["strike"] for s in series for r in s["rows"]})
+    if center and len(pool) > 90:
+        pool = sorted(sorted(pool, key=lambda k: abs(k - center))[:90])
+    if not pool:
         return None
 
-    idx    = {k: j for j, k in enumerate(strikes)}
+    idx    = {k: j for j, k in enumerate(pool)}
     labels = [s["expiry"].strftime("%d %b %Y") for s in series]
-    z_call = [[0] * len(strikes) for _ in series]
-    z_put  = [[0] * len(strikes) for _ in series]
+    z_call = [[0] * len(pool) for _ in series]
+    z_put  = [[0] * len(pool) for _ in series]
 
     for i, s in enumerate(series):
         for r in s["rows"]:
@@ -287,15 +318,18 @@ def build_heatmap(series: list[dict]):
                 z_call[i][j] = r["call_oi"]
                 z_put[i][j]  = r["put_oi"]
 
+    from plotly.subplots import make_subplots
     fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.07,
                         subplot_titles=["CALL OI  ·  опір", "PUT OI  ·  підтримка"])
+    xs = [_sp(k) for k in pool]
+
     fig.add_trace(go.Heatmap(
-        x=strikes, y=labels, z=z_call, showscale=False,
+        x=xs, y=labels, z=z_call, showscale=False,
         colorscale=[[0, "#08080A"], [0.15, "#232329"], [0.5, "#4A4A53"], [1, ASH]],
         hovertemplate="%{y}<br><b>%{x}</b>   Call OI  <b>%{z}</b><extra></extra>",
     ), row=1, col=1)
     fig.add_trace(go.Heatmap(
-        x=strikes, y=labels, z=z_put, showscale=False,
+        x=xs, y=labels, z=z_put, showscale=False,
         colorscale=[[0, "#08080A"], [0.15, "#2E2E33"], [0.5, "#8A8A92"], [1, CHALK]],
         hovertemplate="%{y}<br><b>%{x}</b>   Put OI  <b>%{z}</b><extra></extra>",
     ), row=1, col=2)
@@ -304,7 +338,7 @@ def build_heatmap(series: list[dict]):
         paper_bgcolor=VOID, plot_bgcolor=SURFACE,
         font=dict(color=MUTED, family=MONO, size=10),
         separators=SEPARATORS,
-        height=500, margin=dict(t=44, b=42, l=104, r=18),
+        height=520, margin=dict(t=46, b=44, l=108, r=18),
         hovermode="closest",
         hoverlabel=dict(bgcolor="#111114", bordercolor=RULE,
                         font=dict(color=TEXT, family=MONO, size=12)),
@@ -312,7 +346,7 @@ def build_heatmap(series: list[dict]):
     for ann in fig.layout.annotations:
         ann.font = dict(color=FAINT, size=10, family=MONO)
         ann.y = 1.05
-    fig.update_xaxes(gridcolor=RULE, showline=False, nticks=10, tickformat=",d",
+    fig.update_xaxes(gridcolor=RULE, showline=False, nticks=12,
                      tickfont=dict(color=FAINT, size=9, family=MONO))
     fig.update_yaxes(gridcolor=RULE, showline=False,
                      tickfont=dict(color=FAINT, size=9, family=MONO))
@@ -322,29 +356,35 @@ def build_heatmap(series: list[dict]):
 # ─────────────────────────────────────────────────────────────────────────────
 # Метадані серії для JS
 # ─────────────────────────────────────────────────────────────────────────────
-def build_meta(series: list[dict]) -> list[dict]:
+def build_meta(series):
     meta = []
-    for s in series:
-        spot   = s["spot"]
-        mp     = s["max_pain"]
-        rows   = s["rows"]
+    for i, s in enumerate(series):
+        s.setdefault("base", i * TRACES_PER_SERIES)
+        rows    = s["rows"]
+        strikes = s["strikes"]
+        spot    = s["spot"]
+        mp      = s["max_pain"]
+
+        # Позиції ліній — в індексах категорій, не в цінах
+        spot_x = _cat_pos(strikes, spot)
+        pain_x = _cat_pos(strikes, mp)
 
         shapes, notes = [], []
-        if spot:
+        if spot_x is not None:
             shapes.append(dict(type="line", xref="x", yref="paper",
-                               x0=spot, x1=spot, y0=0, y1=1,
+                               x0=spot_x, x1=spot_x, y0=0, y1=1,
                                line=dict(color=SPOT_C, width=1.5)))
-            notes.append(dict(x=spot, y=1.012, xref="x", yref="paper",
+            notes.append(dict(x=spot_x, y=1.015, xref="x", yref="paper",
                               text="SPOT " + _sp(spot), showarrow=False,
-                              font=dict(color=SPOT_C, size=9.5, family=MONO),
+                              font=dict(color=SPOT_C, size=10, family=MONO),
                               xanchor="center", yanchor="bottom"))
-        if mp:
+        if pain_x is not None:
             shapes.append(dict(type="line", xref="x", yref="paper",
-                               x0=mp, x1=mp, y0=0, y1=1,
+                               x0=pain_x, x1=pain_x, y0=0, y1=1,
                                line=dict(color=PAIN_C, width=1.5, dash="4px,4px")))
-            notes.append(dict(x=mp, y=0.985, xref="x", yref="paper",
+            notes.append(dict(x=pain_x, y=0.982, xref="x", yref="paper",
                               text="MAX PAIN " + _sp(mp), showarrow=False,
-                              font=dict(color=PAIN_C, size=9.5, family=MONO),
+                              font=dict(color=PAIN_C, size=10, family=MONO),
                               xanchor="center", yanchor="top",
                               bgcolor="rgba(0,0,0,0.8)", borderpad=3))
 
@@ -353,19 +393,57 @@ def build_meta(series: list[dict]) -> list[dict]:
         c_vol = sum(r["call_vol"] or 0 for r in rows)
         p_vol = sum(r["put_vol"]  or 0 for r in rows)
 
-        # Коефіцієнти рахуємо ТУТ, із тих самих rows, що дали суми вище.
-        # Раніше бралось збережене s["pcr"], пораховане по ВСЬОМУ ланцюгу,
-        # тоді як суми під плиткою — з видимого вікна ±10%. Через далекі
-        # путові хвости число розходилось із надрукованим поруч і майже
-        # не змінювалось між оновленнями.
+        # Коефіцієнти — з тих самих rows, що дають суми поруч,
+        # інакше плитка розходиться з надрукованими під нею числами.
         pc_oi  = f"{p_oi / c_oi:.2f}"   if c_oi  else "—"
         pc_vol = f"{p_vol / c_vol:.2f}" if c_vol else "—"
 
-        prev   = s["prev"]
-        d_call = sum(r["call_oi"] - prev[r["strike"]]["call_oi"]
-                     for r in rows if r["strike"] in prev) if prev else 0
-        d_put  = sum(r["put_oi"] - prev[r["strike"]]["put_oi"]
-                     for r in rows if r["strike"] in prev) if prev else 0
+        # ── Δ OI: рахуємо явно, щоб відрізнити «немає з чим порівняти»
+        #    від «порівняли, і нічого не змінилось». Раніше обидва випадки
+        #    давали порожнє полотно без жодного пояснення.
+        prev = s["prev"]
+        matched = [r for r in rows if prev and r["strike"] in prev]
+        d_call = sum(r["call_oi"] - prev[r["strike"]]["call_oi"] for r in matched)
+        d_put  = sum(r["put_oi"]  - prev[r["strike"]]["put_oi"]  for r in matched)
+        moves  = [abs(r["call_oi"] - prev[r["strike"]]["call_oi"]) +
+                  abs(r["put_oi"]  - prev[r["strike"]]["put_oi"]) for r in matched]
+        changed = sum(1 for m in moves if m > 0)
+
+        if not prev:
+            d_state, d_note = "none", ("Немає попередньої сесії для порівняння — "
+                                       "Δ OI з'явиться після наступного оновлення даних.")
+        elif changed == 0:
+            d_state, d_note = "flat", (f"Open Interest не змінився з {s['prev_label']} — "
+                                       "провайдер ще не виклав нову нічну обробку.")
+        else:
+            d_state, d_note = "ok", ("Зміна відкритого інтересу проти "
+                                     f"{s['prev_label']}: {changed} страйків рухнулись. "
+                                     "Зростання OI означає, що рівень став вагомішим.")
+
+        d_cap = _cap([abs(v) for v in moves]) if changed else 10
+
+        total_gex = sum(g["gex"] for g in s["gex"]) / 1e9 if s["gex"] else None
+        # Стелі GEX — окремо вгору і вниз. Симетрична вісь марнувала
+        # половину полотна, коли гамма майже вся з одного боку; мінімум
+        # у чверть протилежного боку лишає нульову лінію видимою.
+        # Тільки ті страйки, що реально потрапили на графік: s["gex"] покриває
+        # весь ланцюг, а малюємо ми лише відібране вікно — інакше далекі
+        # страйки задирали стелю і бари губились біля нуля.
+        on_chart = set(strikes)
+        gvis = [g for g in s["gex"] if g["strike"] in on_chart]
+        gpos = [g["gex"] / 1e9 for g in gvis if g["gex"] > 0]
+        gneg = [-g["gex"] / 1e9 for g in gvis if g["gex"] < 0]
+
+        def _gcap(vals):
+            if not vals:
+                return 0.0
+            v = sorted(vals)
+            return v[min(len(v) - 1, int(len(v) * 0.97))] * 1.12
+
+        up, dn = _gcap(gpos), _gcap(gneg)
+        span   = max(up, dn, 0.01)
+        gex_up = max(up, span * 0.25)
+        gex_dn = max(dn, span * 0.25)
 
         pull, direction = "—", "flat"
         if spot and mp:
@@ -374,32 +452,30 @@ def build_meta(series: list[dict]) -> list[dict]:
             elif gap < 0: pull, direction = f"↓ {abs(gap)} пт нижче", "down"
             else:         pull = "на рівні spot"
 
-        total_gex = sum(g["gex"] for g in s["gex"]) / 1e9 if s["gex"] else None
+        tickvals, ticktext = _ticks(strikes)
 
         meta.append(dict(
-            asset      = s["asset"],
-            base       = s["base"],
-            label      = s["expiry"].strftime("%d %b %Y") + " · " + (s["contract_type"] or "—"),
-            spot_txt   = _sp(spot),
-            pain_txt   = _sp(mp),
-            pull_txt   = pull,
-            pull_dir   = direction,
-            pcr        = pc_oi,
-            vol_pc     = pc_vol,
-            gex_txt    = (f"{total_gex:+.2f}B" if total_gex is not None else "—"),
-            gex_dir    = ("up" if (total_gex or 0) >= 0 else "down"),
-            stamp      = s["stamp"],
-            shapes=shapes, annotations=notes, xrange=s["xrange"],
+            asset=s["asset"], base=s["base"],
+            label=s["expiry"].strftime("%d %b %Y") + " · " + (s["contract_type"] or "—"),
+            spot_txt=_sp(spot), pain_txt=_sp(mp),
+            pull_txt=pull, pull_dir=direction,
+            pcr=pc_oi, vol_pc=pc_vol,
+            gex_txt=(f"{total_gex:+.2f}B" if total_gex is not None else "—"),
+            gex_dir=("up" if (total_gex or 0) >= 0 else "down"),
+            stamp=s["stamp"],
+            shapes=shapes, annotations=notes,
+            view=s["view"], nstrikes=len(strikes),
+            tickvals=tickvals, ticktext=ticktext,
             oi_call=s["oi_call"], oi_put=s["oi_put"],
             vol_call=s["vol_call"], vol_put=s["vol_put"],
+            gex_up=round(gex_up, 4), gex_dn=round(gex_dn, 4), d_cap=d_cap,
             c_oi=c_oi, p_oi=p_oi, c_vol=c_vol, p_vol=p_vol,
-            call_walls = [{"s": r["strike"], "oi": r["call_oi"]}
-                          for r in sorted(rows, key=lambda r: r["call_oi"], reverse=True)[:3]],
-            put_walls  = [{"s": r["strike"], "oi": r["put_oi"]}
-                          for r in sorted(rows, key=lambda r: r["put_oi"], reverse=True)[:3]],
-            has_delta  = bool(prev),
-            delta_call = d_call,
-            delta_put  = d_put,
+            call_walls=[{"s": r["strike"], "oi": r["call_oi"]}
+                        for r in sorted(rows, key=lambda r: r["call_oi"], reverse=True)[:3]],
+            put_walls=[{"s": r["strike"], "oi": r["put_oi"]}
+                       for r in sorted(rows, key=lambda r: r["put_oi"], reverse=True)[:3]],
+            d_state=d_state, d_note=d_note,
+            delta_call=d_call, delta_put=d_put,
         ))
     return meta
 
@@ -423,6 +499,7 @@ HTML = r"""<!DOCTYPE html>
   --open:#2DD4A7; --close:#FB7185;
   --mono:'IBM Plex Mono',ui-monospace,'SF Mono','Cascadia Mono',Consolas,monospace;
   --sans:'IBM Plex Sans',-apple-system,'Segoe UI',system-ui,sans-serif;
+  --ease:cubic-bezier(.4,0,.2,1);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html{-webkit-text-size-adjust:100%}
@@ -437,22 +514,22 @@ body{background:var(--void);color:var(--text);font-family:var(--sans);
   box-shadow:0 0 6px var(--spot);flex:none}
 .masthead .grow{flex:1}
 
-/* Перемикач активу — головний елемент шапки */
-.assets{display:flex;gap:0;border:1px solid var(--rule-lit);border-radius:3px;overflow:hidden}
+.assets{display:flex;border:1px solid var(--rule-lit);border-radius:3px;overflow:hidden}
 .assets button{font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.14em;
   padding:5px 18px;background:transparent;color:var(--muted);border:none;
-  border-left:1px solid var(--rule-lit);cursor:pointer;transition:background .15s,color .15s}
+  border-left:1px solid var(--rule-lit);cursor:pointer;
+  transition:background .2s var(--ease),color .2s var(--ease)}
 .assets button:first-child{border-left:none}
 .assets button:hover:not(.on){background:#141417;color:var(--text)}
 .assets button.on{background:var(--spot);color:#000}
 
 .readout{display:grid;grid-template-columns:repeat(5,1fr);
   border-bottom:1px solid var(--rule)}
-.metric{padding:16px 20px 15px;border-left:1px solid var(--rule)}
+.metric{padding:15px 20px 14px;border-left:1px solid var(--rule)}
 .metric:first-child{border-left:none}
-.metric .val{font-family:var(--mono);font-size:27px;font-weight:400;
+.metric .val{font-family:var(--mono);font-size:26px;font-weight:400;
   letter-spacing:-.015em;line-height:1;color:var(--text);
-  font-variant-numeric:tabular-nums}
+  font-variant-numeric:tabular-nums;transition:color .3s var(--ease)}
 .metric .key{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;
   text-transform:uppercase;color:var(--faint);margin-top:9px}
 .metric .sub{font-family:var(--mono);font-size:11px;color:var(--muted);
@@ -460,10 +537,8 @@ body{background:var(--void);color:var(--text);font-family:var(--sans);
 .metric.is-spot .val{color:var(--spot)}
 .metric.is-pain .val{color:var(--pain)}
 .pull{font-weight:500}
-.pull.up{color:var(--open)}
-.pull.down{color:var(--close)}
-.gexval.up{color:var(--spot)}
-.gexval.down{color:var(--close)}
+.pull.up{color:var(--open)} .pull.down{color:var(--close)}
+.gexval.up{color:var(--spot)} .gexval.down{color:var(--close)}
 
 .ladders{display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid var(--rule)}
 .ladder{padding:11px 20px 12px;border-left:1px solid var(--rule)}
@@ -474,28 +549,30 @@ body{background:var(--void);color:var(--text);font-family:var(--sans);
   padding:3px 7px;margin-bottom:2px;font-family:var(--mono);font-size:12px;
   overflow:hidden;font-variant-numeric:tabular-nums}
 .rung .fill{position:absolute;inset:0 auto 0 0;z-index:0;
-  transition:width .32s cubic-bezier(.4,0,.2,1)}
+  transition:width .42s var(--ease)}
 .rung.call .fill{background:rgba(110,110,118,.30)}
 .rung.put .fill{background:rgba(255,255,255,.13)}
 .rung .k,.rung .v{position:relative;z-index:1}
 .rung .k{color:var(--text);letter-spacing:.04em}
 .rung .v{color:var(--muted);font-size:11px}
 
-.bar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:10px 20px;
+.bar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 20px;
   border-bottom:1px solid var(--rule)}
 .seg{display:flex;border:1px solid var(--rule-lit);border-radius:3px;overflow:hidden}
 .seg button{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;
-  text-transform:uppercase;padding:6px 15px;background:transparent;color:var(--muted);
+  text-transform:uppercase;padding:6px 14px;background:transparent;color:var(--muted);
   border:none;border-left:1px solid var(--rule-lit);cursor:pointer;
-  transition:background .15s,color .15s}
+  transition:background .2s var(--ease),color .2s var(--ease)}
 .seg button:first-child{border-left:none}
 .seg button:hover:not(:disabled):not(.on){background:#141417;color:var(--text)}
 .seg button.on{background:var(--text);color:var(--void);font-weight:600}
 .seg button:disabled{color:#2C2C31;cursor:not-allowed}
+.seg.zoom button{padding:6px 11px;font-size:13px;line-height:1}
 
 select{font-family:var(--mono);font-size:11px;color:var(--text);
   background:var(--raised);border:1px solid var(--rule-lit);border-radius:3px;
-  padding:6px 10px;cursor:pointer;outline:none;max-width:250px}
+  padding:6px 10px;cursor:pointer;outline:none;max-width:250px;
+  transition:border-color .2s var(--ease)}
 select:hover{border-color:#38383F}
 
 .ckey{display:flex;gap:14px;align-items:center;font-family:var(--mono);font-size:10px}
@@ -509,14 +586,20 @@ select:hover{border-color:#38383F}
   letter-spacing:.05em}
 .tape div:first-child{border-left:none}
 .tape b{color:var(--text);font-weight:500;margin-left:6px}
+.tape b.flat{color:var(--faint)}
 
 .note{font-family:var(--mono);font-size:10.5px;color:var(--faint);
-  padding:9px 20px 0;min-height:17px;letter-spacing:.03em}
+  padding:9px 20px 0;min-height:17px;letter-spacing:.03em;
+  transition:color .3s var(--ease)}
+.note.warn{color:var(--pain)}
 
 .stage{padding:2px 6px 20px}
 .hidden{display:none}
-.js-plotly-plot .plotly .modebar{background:transparent!important;opacity:.3;
-  transition:opacity .2s}
+/* Крос-фейд замість ривка: графік гасне на час перемальовування
+   і повертається, коли Plotly вже домалював новий стан. */
+#chart,#heat-stage{transition:opacity .2s var(--ease)}
+.js-plotly-plot .plotly .modebar{background:transparent!important;opacity:.28;
+  transition:opacity .25s var(--ease)}
 .js-plotly-plot:hover .plotly .modebar{opacity:1}
 .modebar-btn path{fill:#6E6E76!important}
 .modebar-btn:hover path{fill:#E8E8EA!important}
@@ -529,7 +612,7 @@ select:hover{border-color:#38383F}
   .metric:nth-child(odd){border-left:none}
   .ladders{grid-template-columns:1fr}
   .ladder:last-child{border-left:none;border-top:1px solid var(--rule)}
-  .metric .val{font-size:22px}
+  .metric .val{font-size:21px}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
@@ -585,10 +668,15 @@ select:hover{border-color:#38383F}
 
 <div class="bar">
   <div class="seg" role="group" aria-label="Режим графіка">
-    <button id="b-oi" class="on" onclick="setMode('oi')">OI + Vol</button>
+    <button id="b-oi" class="on" onclick="setMode('oi')">OI</button>
+    <button id="b-vol" onclick="setMode('vol')">Volume</button>
     <button id="b-gex" onclick="setMode('gex')">GEX</button>
     <button id="b-delta" onclick="setMode('delta')">&Delta; OI</button>
     <button id="b-heat" onclick="setMode('heat')">Heatmap</button>
+  </div>
+  <div class="seg zoom" role="group" aria-label="Масштаб">
+    <button id="z-in" onclick="zoom(-1)" title="Щільніше">&minus;</button>
+    <button id="z-out" onclick="zoom(1)" title="Ширше">+</button>
   </div>
   <div class="ckey" id="colorkey"></div>
   <span class="grow"></span>
@@ -613,53 +701,87 @@ select:hover{border-color:#38383F}
 var META      = EXPIRY_META_JSON;
 var ASSETLIST = ASSETLIST_JSON;
 var NTRACES   = NTRACES_VALUE;
+var VIEW      = VIEW_STRIKES_VALUE;
 var T         = 7;
 
 var curAsset = ASSETLIST[0];
-var curIdx   = 0;          // індекс у META
+var curIdx   = 0;
 var curMode  = 'oi';
+var viewWide = VIEW;      // скільки страйків показуємо одразу
+var gen      = 0;         // покоління рендера — захист від гонки
 
 function num(n){
   if(n === null || n === undefined) return '—';
-  return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '\u2009');
+  return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
 }
 function signed(n){
   if(!n) return '0';
-  return (n > 0 ? '+' : '\u2212') + num(Math.abs(n));
+  return (n > 0 ? '+' : '−') + num(Math.abs(n));
 }
-function seriesOf(asset){
+function seriesOf(a){
   return META.map(function(m,i){ return {m:m,i:i}; })
-             .filter(function(x){ return x.m.asset === asset; });
+             .filter(function(x){ return x.m.asset === a; });
 }
 
-/* Кнопки активів */
 (function(){
   document.getElementById('assetbar').innerHTML = ASSETLIST.map(function(a,k){
     return '<button id="a-'+a+'" class="'+(k===0?'on':'')+'" onclick="setAsset(\''+a+'\')">'+a+'</button>';
   }).join('');
 })();
 
+/* Які трейси показати. Індекси рахуємо від m.base — він проставлений
+   у Python, тож JS не мусить сам вгадувати зсув серії. */
 function visibility(){
   var v = new Array(NTRACES).fill(false);
   var o = META[curIdx].base;
-  v[o+2] = v[o+3] = true;                        // Volume — завжди
-  if(curMode === 'oi')         { v[o] = v[o+1] = true; }
+  if(curMode === 'oi')         { v[o]   = v[o+1] = true; }
+  else if(curMode === 'vol')   { v[o+2] = v[o+3] = true; }
   else if(curMode === 'gex')   { v[o+4] = true; }
   else if(curMode === 'delta') { v[o+5] = v[o+6] = true; }
   return v;
 }
 
+function yRange(m){
+  if(curMode === 'oi')    return [-m.oi_put,  m.oi_call];
+  if(curMode === 'vol')   return [-m.vol_put, m.vol_call];
+  if(curMode === 'gex')   return [-m.gex_dn, m.gex_up];
+  return [-m.d_cap, m.d_cap];
+}
+function yTitle(){
+  return curMode === 'vol'   ? 'VOLUME'
+       : curMode === 'gex'   ? 'GEX  ·  B $ / 1%'
+       : curMode === 'delta' ? 'Δ OPEN INTEREST'
+       : 'OPEN INTEREST';
+}
+
+/* Видиме вікно в індексах страйків, відцентроване на поточному вигляді. */
+function xRange(m){
+  var n = m.nstrikes;
+  if(n <= viewWide) return [-0.5, n - 0.5];
+  var mid = (m.view[0] + m.view[1]) / 2;
+  var half = viewWide / 2;
+  var lo = Math.max(-0.5, mid - half);
+  var hi = Math.min(n - 0.5, lo + viewWide);
+  lo = Math.max(-0.5, hi - viewWide);
+  return [lo, hi];
+}
+
 var KEYS = {
   oi:    [['Calls','var(--ash)'], ['Puts','var(--chalk)']],
+  vol:   [['Calls','var(--ash)'], ['Puts','var(--chalk)']],
   gex:   [['лонг гамма · гасить рух','var(--spot)'], ['шорт гамма · підсилює','var(--close)']],
   delta: [['позиції відкрито','var(--open)'], ['позиції закрито','var(--close)']],
   heat:  [['Calls','var(--ash)'], ['Puts','var(--chalk)']]
 };
 
 var NOTES = {
-  gex:   'Позитивний GEX — маркет-мейкери гасять рух і рівень тримає. Негативний — хеджування підсилює рух у той самий бік.',
-  delta: 'Зміна відкритого інтересу проти попереднього запуску. Зростання OI на страйку означає, що рівень став вагомішим.',
-  heat:  'Вертикальні смуги — страйки, що тримають OI одразу на кількох експіраціях. Це найстійкіші рівні.'
+  oi:   'Puts вниз — підтримка. Calls вгору — опір. Вісь обрізана за перцентилем, '
+      + 'щоб поодинокі величезні страйки не з\'їдали графік — повний розмах видно скролом.',
+  vol:  'Обсяг торгів за сесію. На відміну від OI оновлюється протягом дня.',
+  gex:  'Позитивний GEX — маркет-мейкери гасять рух і рівень тримає. '
+      + 'Негативний — хеджування підсилює рух у той самий бік.',
+  heat: 'Вертикальні смуги — страйки, що тримають OI одразу на кількох експіраціях. '
+      + 'Це найстійкіші рівні.'
 };
 
 function drawKey(){
@@ -695,12 +817,12 @@ function fillPicker(){
 }
 
 function render(){
-  var m = META[curIdx];
+  var my = ++gen;                      // мітка цього виклику
+  var m  = META[curIdx];
   var heat = (curMode === 'heat');
 
   document.getElementById('main-stage').classList.toggle('hidden', heat);
   document.getElementById('heat-stage').classList.toggle('hidden', !heat);
-
   ASSETLIST.forEach(function(a){
     var el = document.getElementById('heat-' + a);
     if(el) el.parentElement.classList.toggle('hidden', a !== curAsset);
@@ -711,39 +833,28 @@ function render(){
     if(hd) Plotly.Plots.resize(hd);
   } else {
     var gd = document.getElementById('chart');
-    var title = curMode === 'delta' ? 'Δ OPEN INTEREST'
-              : curMode === 'gex'   ? 'GEX  ·  B $ / 1%'
-              : 'OPEN INTEREST';
-    /* Обов'язково двома викликами.
-       Plotly.update(visible + xaxis.range) в одному виклику оновлює
-       layout, але не _fullLayout — рендер бере другий, і бари малюються
-       за діапазоном попереднього активу, тобто за межами полотна.
-       Перевірено: restyle → relayout тримає обидва в синхроні. */
-    /* shared_xaxes=True створює дві осі X: xaxis (верхній ряд) має
-       matches:'x2', тобто підпорядкована майстру xaxis2. Якщо задати
-       лише 'xaxis.range', майстер перебиває його назад і бари
-       малюються за діапазоном попереднього активу. Задаємо обидві. */
+    gd.style.opacity = '0.35';         // гасимо на час перемальовування
     var lay = {
       shapes: m.shapes,
       annotations: m.annotations,
-      'xaxis.range':  m.xrange,
-      'xaxis2.range': m.xrange,
-      'yaxis.title.text': title,
-      /* Volume завжди за своєю стелею */
-      'yaxis2.range': [-m.vol_put, m.vol_call],
-      'yaxis2.autorange': false
+      'xaxis.range': xRange(m),
+      'xaxis.tickvals': m.tickvals,
+      'xaxis.ticktext': m.ticktext,
+      'yaxis.range': yRange(m),
+      'yaxis.autorange': false,
+      'yaxis.title.text': yTitle()
     };
-    /* Верхня панель: у режимі OI тримаємо стелю за перцентилем,
-       у GEX та Δ OI масштаб зовсім інший — віддаємо autorange. */
-    if(curMode === 'oi'){
-      lay['yaxis.range'] = [-m.oi_put, m.oi_call];
-      lay['yaxis.autorange'] = false;
-    } else {
-      lay['yaxis.autorange'] = true;
-    }
+    /* Вісь одна (Volume переїхав у власну вкладку), тож зникла колишня
+       пара xaxis/xaxis2 з matches, через яку діапазон відкочувався назад.
+       Лишається гонка промісів: якщо під час restyle прилетів новий
+       render, старий не має права домальовувати — звідси мітка `my`. */
     Plotly.restyle(gd, { visible: visibility() }).then(function(){
+      if(my !== gen) return;
       return Plotly.relayout(gd, lay);
-    });
+    }).then(function(){
+      if(my !== gen) return;
+      gd.style.opacity = '1';
+    }).catch(function(){ gd.style.opacity = '1'; });
   }
 
   document.getElementById('m-stamp').textContent = m.stamp;
@@ -766,22 +877,32 @@ function render(){
   document.getElementById('t-coi').textContent = num(m.c_oi);
   document.getElementById('t-pv').textContent  = num(m.p_vol);
   document.getElementById('t-cv').textContent  = num(m.c_vol);
-  document.getElementById('t-dc').textContent  = m.has_delta ? signed(m.delta_call) : '—';
-  document.getElementById('t-dp').textContent  = m.has_delta ? signed(m.delta_put)  : '—';
+
+  /* Δ OI у стрічці: прочерк, коли порівнювати нема з чим — інакше «0»
+     читається як «нічого не змінилось», хоча дані просто відсутні. */
+  var dc = document.getElementById('t-dc'), dp = document.getElementById('t-dp');
+  dc.textContent = m.d_state === 'none' ? '—' : signed(m.delta_call);
+  dp.textContent = m.d_state === 'none' ? '—' : signed(m.delta_put);
+  dc.className = m.d_state === 'ok' ? '' : 'flat';
+  dp.className = m.d_state === 'ok' ? '' : 'flat';
 
   drawLadder(m.call_walls, 'l-call', 'call');
   drawLadder(m.put_walls,  'l-put',  'put');
   drawKey();
 
-  var anyDelta = seriesOf(curAsset).some(function(x){ return x.m.has_delta; });
-  document.getElementById('b-delta').disabled = !anyDelta;
-  if(!anyDelta && curMode === 'delta') setMode('oi');
+  document.getElementById('b-delta').disabled = (m.d_state === 'none');
 
-  document.getElementById('note').textContent = NOTES[curMode]
-    || ('Puts вниз — підтримка. Calls вгору — опір. Шкали обрізані за 95-м '
-        + 'перцентилем (OI +' + num(m.oi_call) + ' / \u2212' + num(m.oi_put)
-        + '), щоб поодинокі величезні страйки не з\'їдали графік — повний '
-        + 'розмах видно скролом.');
+  var note = document.getElementById('note');
+  if(curMode === 'delta'){
+    note.textContent = m.d_note;
+    note.className = 'note' + (m.d_state === 'ok' ? '' : ' warn');
+  } else {
+    note.textContent = NOTES[curMode] || '';
+    note.className = 'note';
+  }
+
+  document.getElementById('z-in').disabled  = viewWide <= 14;
+  document.getElementById('z-out').disabled = viewWide >= m.nstrikes;
 }
 
 function setAsset(a){
@@ -793,17 +914,34 @@ function setAsset(a){
   fillPicker();
   render();
 }
-function setSeries(i){ curIdx = parseInt(i, 10); render(); }
+function setSeries(i){
+  var next = parseInt(i, 10);
+  if(next === curIdx) return;
+  curIdx = next;
+  /* Δ OI недоступний на новій експірації — не лишаємо порожнє полотно */
+  if(curMode === 'delta' && META[curIdx].d_state === 'none') curMode = 'oi', syncModeButtons();
+  render();
+}
+function syncModeButtons(){
+  [['oi','b-oi'],['vol','b-vol'],['gex','b-gex'],['delta','b-delta'],['heat','b-heat']]
+    .forEach(function(p){
+      document.getElementById(p[1]).classList.toggle('on', curMode === p[0]);
+    });
+}
 function setMode(mode){
+  if(mode === curMode) return;
   curMode = mode;
-  [['oi','b-oi'],['gex','b-gex'],['delta','b-delta'],['heat','b-heat']].forEach(function(p){
-    document.getElementById(p[1]).classList.toggle('on', curMode === p[0]);
-  });
+  syncModeButtons();
+  render();
+}
+function zoom(dir){
+  var step = Math.max(6, Math.round(viewWide * 0.35));
+  viewWide = Math.max(14, Math.min(META[curIdx].nstrikes, viewWide + dir * step));
   render();
 }
 
 var booted = false;
-function boot(){ fillPicker(); render(); booted = true; }
+function boot(){ fillPicker(); syncModeButtons(); render(); booted = true; }
 var chartEl = document.getElementById('chart');
 if(chartEl && chartEl.on){
   chartEl.on('plotly_afterplot', function(){ if(!booted) setTimeout(boot, 60); });
@@ -819,11 +957,7 @@ window.addEventListener('resize', function(){
 </html>"""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-def build_html(series: list[dict]) -> str:
-    # Базовий індекс трейсів — джерело правди для JS.
-    # Проставляємо тут, до обох білдерів, щоб build_meta не залежав
-    # від того, чи викликали перед ним build_figure.
+def build_html(series):
     for i, s in enumerate(series):
         s["base"] = i * TRACES_PER_SERIES
 
@@ -831,12 +965,10 @@ def build_html(series: list[dict]) -> str:
     meta = build_meta(series)
 
     cfg = {"scrollZoom": True, "displayModeBar": True, "displaylogo": False,
-           "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d",
-                                      "toggleSpikelines"]}
+           "modeBarButtonsToRemove": ["select2d", "lasso2d", "toggleSpikelines"]}
     main_div = fig.to_html(full_html=False, include_plotlyjs=PLOTLY_JS,
                            div_id="chart", config=cfg)
 
-    # Один heatmap на актив
     parts, first = [], True
     for asset in ASSETS:
         sub = [s for s in series if s["asset"] == asset]
@@ -851,17 +983,18 @@ def build_html(series: list[dict]) -> str:
         parts.append(f"<div class='{'' if first else 'hidden'}'>{inner}</div>")
         first = False
 
-    assets_present = [a for a in ASSETS if any(s["asset"] == a for s in series)]
+    present = [a for a in ASSETS if any(s["asset"] == a for s in series)]
 
     return (HTML
-            .replace("PLOTLY_DIV",       main_div)
-            .replace("HEATMAP_DIVS",     "\n".join(parts))
-            .replace("NTRACES_VALUE",    str(len(series) * TRACES_PER_SERIES))
-            .replace("ASSETLIST_JSON",   json.dumps(assets_present))
-            .replace("EXPIRY_META_JSON", json.dumps(meta, ensure_ascii=False)))
+            .replace("PLOTLY_DIV",         main_div)
+            .replace("HEATMAP_DIVS",       "\n".join(parts))
+            .replace("NTRACES_VALUE",      str(len(series) * TRACES_PER_SERIES))
+            .replace("VIEW_STRIKES_VALUE", str(VIEW_STRIKES))
+            .replace("ASSETLIST_JSON",     json.dumps(present))
+            .replace("EXPIRY_META_JSON",   json.dumps(meta, ensure_ascii=False)))
 
 
-def collect(asset: str) -> list[dict]:
+def collect(asset):
     """Тягне актив, зберігає в базу, рахує аналітику, повертає серії."""
     provider = CboeProvider(asset, max_expiries=MAX_EXPIRIES)
     chains, spot, ts = provider.fetch()
@@ -875,9 +1008,9 @@ def collect(asset: str) -> list[dict]:
     stamp = ts.strftime("%d %b %Y  %H:%M").upper() if ts else trade_date.strftime("%d %b %Y").upper()
     mult  = MULTIPLIER.get(asset, 100.0)
 
-    # Попередній запуск — для Δ OI
-    _, prev_chains = load_previous(asset)
+    prev_date, prev_chains = load_previous(asset)
     prev_lookup = {c["expiry"]: c["strikes"] for c in prev_chains}
+    prev_label  = prev_date.strftime("%d %b") if prev_date else "—"
 
     _, stored = load_latest(asset)
     stored_by_expiry = {d["expiry"]: d for d in stored}
@@ -897,25 +1030,27 @@ def collect(asset: str) -> list[dict]:
         if gex:
             save_gex(rec["chain_id"], gex)
 
-        center = spot or mp
-        rows = _filter(rec["strikes"], center)
+        center  = spot or mp
+        rows    = _window(rec["strikes"], center)
+        strikes = [r["strike"] for r in rows]
+
         series.append(dict(
             asset=asset, expiry=ch.expiry, contract_type=ch.contract_type,
-            rows=rows,
+            rows=rows, strikes=strikes,
             gex=gex, spot=spot, max_pain=mp, pcr=pcr,
-            center=center, xrange=_xrange(center),
+            center=center, view=_view_range(strikes, center),
             prev=prev_lookup.get(ch.expiry, {}),
+            prev_label=prev_label,
             stamp=stamp,
-            # Шкали рахуємо на кожну серію окремо: тижнева NDX має OI
-            # у десятки, місячна SPX — у тисячі. Спільна стеля зробила б
-            # одну з них нечитабельною.
-            oi_call  = _cap(r["call_oi"]        for r in rows),
-            oi_put   = _cap(r["put_oi"]         for r in rows),
-            vol_call = _cap(r["call_vol"] or 0  for r in rows),
-            vol_put  = _cap(r["put_vol"]  or 0  for r in rows),
+            # Стелі рахуємо на кожну серію окремо: тижнева має OI у сотні,
+            # місячна — у десятки тисяч; спільна шкала вбила б одну з них.
+            oi_call  = _cap(r["call_oi"]       for r in rows),
+            oi_put   = _cap(r["put_oi"]        for r in rows),
+            vol_call = _cap((r["call_vol"] or 0) for r in rows),
+            vol_put  = _cap((r["put_vol"]  or 0) for r in rows),
         ))
 
-    print(f"  {asset}: {len(series)} експірацій, spot {spot}")
+    print(f"  {asset}: {len(series)} експірацій, spot {spot}, Δ проти {prev_label}")
     return series
 
 
@@ -937,7 +1072,7 @@ def main():
 
     html = build_html(series)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out  = OUT_DIR / "us_options.html"
+    out = OUT_DIR / "us_options.html"
     out.write_text(html, encoding="utf-8")
     print(f"  {out.name} готовий" + ("" if HEADLESS else " — відкриваю браузер") + "\n")
     if not HEADLESS:
