@@ -38,15 +38,14 @@ TEXT, MUTED, FAINT  = "#E8E8EA", "#6E6E76", "#45454C"
 SEPARATORS = ". "
 MONO = "'IBM Plex Mono', ui-monospace, 'SF Mono', Consolas, monospace"
 
-# Скільки ціни тримаємо в наборі та скільки видно одразу.
-# Рахуємо у ВІДСОТКАХ ціни, а не в кількості страйків: сітка нерівномірна
-# (біля грошей крок 5, далі 25 і 50), тож «46 страйків» давало ±1.5 % огляду
-# в SPX і ±7 % у DAX. Щоб бари при цьому лишались рівними й читабельними,
-# страйки групуються в бакети природного кроку сітки — див. _auto_step.
-KEEP_PCT  = 0.26   # лишаємо в даних — решта доступна скролом
-VIEW_SPAN = 0.09   # ±9 % ціни видно одразу
-WANT_BARS = 64     # цільова кількість барів у видимому вікні
-MAX_BARS  = 150    # стеля барів у наборі, щоб сторінка не розпухала
+# Скільки страйків тримати в наборі та скільки показувати одразу.
+# Рахуємо у СТРАЙКАХ, бо один бар = один страйк: зводити сусідні страйки в
+# смугу не можна — рівень, розмазаний на 100 пунктів, неможливо ні прочитати,
+# ні позначити на графіку. Бюджет барів підібраний під читабельну ширину
+# (~14 px при 1500 px полотна); який діапазон ціни це охопить, вирішує сітка
+# самого інструмента.
+KEEP_STRIKES = 220    # лишаємо в даних — решта доступна скролом
+VIEW_STRIKES = 84     # видно одразу; −/+ розсуває
 
 TRACES_PER_SERIES = 7  # call_oi, put_oi, call_vol, put_vol, gex, d_call, d_put
 
@@ -55,144 +54,14 @@ def _sp(v, f=",.0f"):
     return f"{v:{f}}".replace(",", " ") if v is not None else "—"
 
 
-def _grid_steps(strikes):
-    """Які кроки реально є в сітці страйків, від меншого до більшого."""
-    if len(strikes) < 2:
-        return [1.0]
-    steps = set()
-    for i in range(len(strikes) - 1):
-        d = round(strikes[i + 1] - strikes[i], 2)
-        if d > 0:
-            steps.add(d)
-    return sorted(steps)
-
-
-def _auto_step(strikes, center, want_bars=WANT_BARS, span=VIEW_SPAN):
-    """
-    Крок групування: беремо його з РЕАЛЬНОЇ сітки, а не довільне число.
-
-    Малювати кожен страйк означає ±1.5 % огляду в SPX — надто близько.
-    Штучний крок на кшталт 10 розрізав би зону з кроком 25 навпіл і дав
-    нерівні бакети. Тому перебираємо саме наявні кроки й беремо перший,
-    що вміщає потрібний діапазон у want_bars барів.
-    """
-    if not strikes or not center:
-        return 0.0
-    avail = _grid_steps(strikes)
-    if not avail:
-        return 0.0
-    width = center * span * 2
-    for s in avail:
-        if width / s <= want_bars:
-            return s
-    big = avail[-1]
-    while width / big > want_bars:
-        big *= 2
-    return big
-
-
-def _bucket(rows, step, prev=None, center=None, max_bars=MAX_BARS):
-    """
-    Зводить страйки в бакети кроку `step`, підсумовуючи OI, обсяг і Δ OI.
-
-    Суми в межах бакета зберігаються, тож підсумки під плитками не
-    змінюються; що втрачається — точна адреса всередині бакета, тому
-    драбина стінок навмисно рахується по НЕзгрупованих страйках.
-
-    Δ OI рахується тут, а не в build_figure: після групування страйк
-    бакета вже не збігається з ключем попередньої сесії, тож порівнювати
-    треба до злиття.
-    """
+def _window(rows, center, keep=KEEP_STRIKES):
+    """Лишає `keep` страйків, найближчих до центру, у порядку зростання."""
     if not rows:
         return []
-    out = {}
-    for r in rows:
-        k = (round(r["strike"] / step) * step) if step and step > 0 else r["strike"]
-        b = out.get(k)
-        if b is None:
-            b = out[k] = {"strike": float(k), "call_oi": 0, "put_oi": 0,
-                          "call_vol": 0, "put_vol": 0, "d_call": 0, "d_put": 0,
-                          "n": 0, "lo": r["strike"], "hi": r["strike"]}
-        b["call_oi"]  += r["call_oi"]
-        b["put_oi"]   += r["put_oi"]
-        b["call_vol"] += r["call_vol"] or 0
-        b["put_vol"]  += r["put_vol"]  or 0
-        b["n"]        += 1
-        if r["strike"] < b["lo"]: b["lo"] = r["strike"]
-        if r["strike"] > b["hi"]: b["hi"] = r["strike"]
-        p = prev.get(r["strike"]) if prev else None
-        if p:
-            b["d_call"] += r["call_oi"] - p["call_oi"]
-            b["d_put"]  += r["put_oi"]  - p["put_oi"]
-
-    res = sorted(out.values(), key=lambda b: b["strike"])
-    if len(res) > max_bars:
-        c = center or res[len(res) // 2]["strike"]
-        res = sorted(sorted(res, key=lambda b: abs(b["strike"] - c))[:max_bars],
-                     key=lambda b: b["strike"])
-    return res
-
-
-def _bucket_gex(gex_rows, step, keep):
-    """
-    Те саме для GEX: сумуємо в бакеті, IV беремо середню.
-
-    `keep` — набір страйків бакетів, що лишились після обрізки в _bucket,
-    інакше GEX ліз би за межі намальованого вікна й задирав стелю осі.
-    """
-    if not gex_rows:
-        return []
-    out = {}
-    for g in gex_rows:
-        k = (round(g["strike"] / step) * step) if step and step > 0 else g["strike"]
-        k = float(k)
-        if keep and k not in keep:
-            continue
-        b = out.get(k)
-        if b is None:
-            b = out[k] = {"strike": k, "gex": 0.0, "_civ": [], "_piv": []}
-        b["gex"] += g["gex"]
-        if g.get("call_iv"): b["_civ"].append(g["call_iv"])
-        if g.get("put_iv"):  b["_piv"].append(g["put_iv"])
-
-    res = []
-    for k in sorted(out):
-        b = out[k]
-        res.append({"strike": b["strike"], "gex": b["gex"],
-                    "call_iv": (sum(b["_civ"]) / len(b["_civ"])) if b["_civ"] else None,
-                    "put_iv":  (sum(b["_piv"]) / len(b["_piv"]))  if b["_piv"]  else None})
-    return res
-
-
-def _window(rows, center, pct=KEEP_PCT):
-    """
-    Лишає страйки в межах ±pct від центру, у порядку зростання.
-
-    Раніше лишали фіксовану кількість страйків — і той самий «46» давав
-    зовсім різний огляд на різних сітках. Відсоток однаковий для всіх.
-    """
-    if not rows:
-        return []
-    ordered = sorted(rows, key=lambda r: r["strike"])
     if not center:
-        return ordered
-    lo, hi = center * (1 - pct), center * (1 + pct)
-    near = [r for r in ordered if lo <= r["strike"] <= hi]
-    return near or ordered
-
-
-def _step_txt(step, n_bars, n_raw):
-    """
-    Підпис під графіком: що саме означає один бар.
-
-    Це не косметика. Бар складає OI усіх страйків своєї смуги, тож без
-    підпису сума смуги читається як OI одного рівня. Для підтримки й опору
-    сумарний OI у смузі — саме те, що треба: 5 страйків по 1000 у межах
-    25 пунктів важать більше, ніж один далекий страйк на 1000.
-    """
-    if not step or n_bars == 0 or n_bars >= n_raw:
-        return "1 бар = 1 страйк"
-    return "1 бар = %s пт (сума OI у смузі)" % _sp(step)
+        return sorted(rows, key=lambda r: r["strike"])[:keep]
+    near = sorted(rows, key=lambda r: abs(r["strike"] - center))[:keep]
+    return sorted(near, key=lambda r: r["strike"])
 
 
 def _cat_pos(strikes, value):
@@ -217,14 +86,11 @@ def _cat_pos(strikes, value):
     return float(len(strikes) - 1)
 
 
-def _view_range(strikes, center, step=None, span=VIEW_SPAN):
-    """Видиме вікно в індексах барів — рівно ±span ціни навколо центру."""
+def _view_range(strikes, center, width=VIEW_STRIKES):
+    """Видиме вікно в індексах страйків, відцентроване на ціні."""
     n = len(strikes)
     if n == 0:
         return None
-    width = WANT_BARS
-    if step and step > 0 and center:
-        width = max(12.0, center * span * 2.0 / step)
     if n <= width:
         return [-0.5, n - 0.5]
     mid = _cat_pos(strikes, center)
@@ -237,12 +103,26 @@ def _view_range(strikes, center, step=None, span=VIEW_SPAN):
     return [lo, hi]
 
 
+def _categories(series):
+    """
+    Спільний для всіх серій, відсортований перелік страйків.
+
+    Plotly впорядковує категорії за появою в трейсах. Якщо кожна серія
+    принесе свій перелік, страйки другої експірації допишуться в кінець
+    замість своїх місць — і бари поїдуть. Тому вісь будуємо один раз на
+    об'єднанні, а кожна серія малюється у своїх позиціях цього переліку.
+    """
+    return sorted({r["strike"] for s in series for r in s["rows"]})
+
+
 def _ticks(strikes, every=None):
     n = len(strikes)
     if n == 0:
         return [], []
     if every is None:
-        every = max(1, round(n / 26))
+        # Щільність — від видимого вікна, а не від усього набору:
+        # перелік тепер спільний на всі експірації й помітно довший.
+        every = max(1, round(VIEW_STRIKES / 12))
     idx = list(range(0, n, every))
     return idx, [_sp(strikes[i]) for i in idx]
 
@@ -271,7 +151,7 @@ def _cap(values, pct=0.97, mult=1.1, floor=10):
 # ─────────────────────────────────────────────────────────────────────────────
 # Головна фігура — ОДНЕ полотно, індексна вісь X
 # ─────────────────────────────────────────────────────────────────────────────
-def build_figure(series):
+def build_figure(series, cats=None):
     """
     Кожна серія додає TRACES_PER_SERIES трейсів:
       0 call_oi  1 put_oi  2 call_vol  3 put_vol  4 gex  5 d_call  6 d_put
@@ -285,16 +165,17 @@ def build_figure(series):
     висоту — на двох панелях бари були вдвічі нижчі й гірше читались.
     """
     fig = go.Figure()
+    cats   = _categories(series) if cats is None else cats
+    catlab = [_sp(k) for k in cats]
 
     for i, s in enumerate(series):
         s.setdefault("base", i * TRACES_PER_SERIES)
         rows    = s["rows"]
         strikes = [r["strike"] for r in rows]
-        xs      = list(range(len(rows)))          # 0,1,2… — рівний крок
-        # Підпис бакета: один страйк — просто число, кілька — діапазон,
-        # щоб було видно, що бар складений, а не один рівень.
-        labels  = [_sp(r["strike"]) if r.get("n", 1) <= 1
-                   else "%s–%s" % (_sp(r["lo"]), _sp(r["hi"])) for r in rows]
+        # x — підпис страйка, а не номер: вісь категорійна, тож у шапці
+        # підказки стоїть сам страйк. Ширина бара від цього не залежить.
+        labels  = [_sp(k) for k in strikes]
+        xs      = labels
         shown   = (i == 0)
         base    = dict(marker_line_width=0, visible=shown, showlegend=False,
                        width=0.82, customdata=labels)
@@ -302,27 +183,27 @@ def build_figure(series):
         fig.add_trace(go.Bar(
             x=xs, y=[r["call_oi"] for r in rows], name="Call OI",
             marker_color=ASH,
-            hovertemplate="<b>%{customdata}</b>   Call OI  <b>%{y}</b><extra></extra>",
+            hovertemplate="Call OI  <b>%{y:,}</b><extra></extra>",
             **base,
         ))
         fig.add_trace(go.Bar(
             x=xs, y=[-r["put_oi"] for r in rows], name="Put OI",
             marker_color=CHALK,
             customdata=[[l, r["put_oi"]] for l, r in zip(labels, rows)],
-            hovertemplate="<b>%{customdata[0]}</b>   Put OI  <b>%{customdata[1]}</b><extra></extra>",
+            hovertemplate="Put OI  <b>%{customdata[1]:,}</b><extra></extra>",
             **{k: v for k, v in base.items() if k != "customdata"},
         ))
         fig.add_trace(go.Bar(
             x=xs, y=[r["call_vol"] or 0 for r in rows], name="Call Vol",
             marker_color=ASH, opacity=0.85,
-            hovertemplate="<b>%{customdata}</b>   Call Vol  <b>%{y}</b><extra></extra>",
+            hovertemplate="Call Vol  <b>%{y:,}</b><extra></extra>",
             **base,
         ))
         fig.add_trace(go.Bar(
             x=xs, y=[-(r["put_vol"] or 0) for r in rows], name="Put Vol",
             marker_color=CHALK, opacity=0.85,
             customdata=[[l, r["put_vol"] or 0] for l, r in zip(labels, rows)],
-            hovertemplate="<b>%{customdata[0]}</b>   Put Vol  <b>%{customdata[1]}</b><extra></extra>",
+            hovertemplate="Put Vol  <b>%{customdata[1]:,}</b><extra></extra>",
             **{k: v for k, v in base.items() if k != "customdata"},
         ))
 
@@ -341,29 +222,31 @@ def build_figure(series):
             visible=False, showlegend=False, marker_line_width=0,
             marker_color=[GEX_POS if v >= 0 else GEX_NEG for v in gy],
             customdata=gtxt,
-            hovertemplate="<b>%{customdata[0]}</b>   GEX  <b>%{y:.2f}M €</b>"
+            hovertemplate="GEX  <b>%{y:.2f}M €</b>"
                           "<br>%{customdata[1]}<extra></extra>",
         ))
 
         # ── Δ OI ─────────────────────────────────────────────────────────────
-        # Дельти вже зведені по бакетах у _bucket: після групування страйк
-        # бакета не збігається з ключем попередньої сесії.
-        dcall = [r.get("d_call", 0)    for r in rows]
-        dput  = [-r.get("d_put", 0)    for r in rows]
+        prev = s["prev"]
+        dcall, dput = [], []
+        for r in rows:
+            p = prev.get(r["strike"]) if prev else None
+            dcall.append((r["call_oi"] - p["call_oi"]) if p else 0)
+            dput.append((-(r["put_oi"] - p["put_oi"])) if p else 0)
 
         fig.add_trace(go.Bar(
             x=xs, y=dcall, name="Δ Call", width=0.82,
             visible=False, showlegend=False, marker_line_width=0,
             marker_color=[D_OPEN if v >= 0 else D_CLOSE for v in dcall],
             customdata=labels,
-            hovertemplate="<b>%{customdata}</b>   Δ Call OI  <b>%{y:+}</b><extra></extra>",
+            hovertemplate="Δ Call OI  <b>%{y:+,}</b><extra></extra>",
         ))
         fig.add_trace(go.Bar(
             x=xs, y=dput, name="Δ Put", width=0.82,
             visible=False, showlegend=False, marker_line_width=0,
             marker_color=[D_CLOSE if v >= 0 else D_OPEN for v in dput],
             customdata=[[l, -v] for l, v in zip(labels, dput)],
-            hovertemplate="<b>%{customdata[0]}</b>   Δ Put OI  <b>%{customdata[1]:+}</b><extra></extra>",
+            hovertemplate="Δ Put OI  <b>%{customdata[1]:+,}</b><extra></extra>",
         ))
 
     head = series[0]
@@ -385,12 +268,13 @@ def build_figure(series):
     spike = dict(showspikes=True, spikecolor="#3A3A42", spikethickness=1,
                  spikedash="solid", spikemode="across", spikesnap="cursor")
 
-    tickvals, ticktext = _ticks(head["strikes"])
+    tickvals, ticktext = _ticks(cats)
     fig.update_xaxes(
+        type="category", categoryorder="array", categoryarray=catlab,
         gridcolor=RULE, zerolinecolor="#2E2E35", showline=False,
         tickfont=dict(color=FAINT, size=10, family=MONO),
         tickmode="array", tickvals=tickvals, ticktext=ticktext,
-        range=head["view"], **spike,
+        range=_view_range(cats, head["center"]), **spike,
     )
     fig.update_yaxes(
         gridcolor=RULE, zerolinecolor="#2E2E35", zerolinewidth=1, showline=False,
@@ -468,12 +352,15 @@ def build_heatmap(series):
 # ─────────────────────────────────────────────────────────────────────────────
 # Метадані серії для JS
 # ─────────────────────────────────────────────────────────────────────────────
-def build_meta(series):
+def build_meta(series, cats=None):
+    cats = _categories(series) if cats is None else cats
     meta = []
     for i, s in enumerate(series):
         s.setdefault("base", i * TRACES_PER_SERIES)
         rows    = s["rows"]
-        strikes = s["strikes"]
+        # Позиції ліній і вікно — у спільному переліку категорій,
+        # бо саме він задає індекси осі.
+        strikes = cats
         spot    = s["spot"]
         mp      = s["max_pain"]
 
@@ -513,18 +400,13 @@ def build_meta(series):
         # ── Δ OI: рахуємо явно, щоб відрізнити «немає з чим порівняти»
         #    від «порівняли, і нічого не змінилось». Раніше обидва випадки
         #    давали порожнє полотно без жодного пояснення.
-        # Порівнюємо по НЕзгрупованих страйках: після бакетування ключ
-        # бакета вже не збігається з ключем попередньої сесії. Стеля осі
-        # при цьому має бути в масштабі БАРІВ, тож беремо її з дельт бакетів.
         prev = s["prev"]
-        raw  = s.get("raw") or rows
-        matched = [r for r in raw if prev and r["strike"] in prev]
+        matched = [r for r in rows if prev and r["strike"] in prev]
         d_call = sum(r["call_oi"] - prev[r["strike"]]["call_oi"] for r in matched)
         d_put  = sum(r["put_oi"]  - prev[r["strike"]]["put_oi"]  for r in matched)
-        changed = sum(1 for r in matched
-                      if r["call_oi"] != prev[r["strike"]]["call_oi"]
-                      or r["put_oi"]  != prev[r["strike"]]["put_oi"])
-        moves = [abs(r.get("d_call", 0)) + abs(r.get("d_put", 0)) for r in rows]
+        moves  = [abs(r["call_oi"] - prev[r["strike"]]["call_oi"]) +
+                  abs(r["put_oi"]  - prev[r["strike"]]["put_oi"]) for r in matched]
+        changed = sum(1 for m in moves if m > 0)
 
         if not prev:
             d_state, d_note = "none", ("Немає попередньої сесії для порівняння — "
@@ -569,7 +451,7 @@ def build_meta(series):
             elif gap < 0: pull, direction = f"↓ {abs(gap)} пт нижче", "down"
             else:         pull = "на рівні spot"
 
-        tickvals, ticktext = _ticks(strikes)
+        tickvals, ticktext = _ticks(cats)
 
         meta.append(dict(
             base=s["base"],
@@ -581,19 +463,19 @@ def build_meta(series):
             gex_dir=("up" if (total_gex or 0) >= 0 else "down"),
             stamp=s["stamp"],
             shapes=shapes, annotations=notes,
-            view=s["view"], nstrikes=len(strikes),
-            step_txt=_step_txt(s.get("step") or 0, len(strikes), len(raw)),
+            view=_view_range(cats, s["center"]), nstrikes=len(cats),
+            # Самі страйки: підпис «видно X – Y» має оновлюватись на зумі,
+            # а зум живе в JS. Це ~1 KB на серію.
+            slist=cats, center_num=(s.get("center") or spot),
             tickvals=tickvals, ticktext=ticktext,
             oi_call=s["oi_call"], oi_put=s["oi_put"],
             vol_call=s["vol_call"], vol_put=s["vol_put"],
             gex_up=round(gex_up, 4), gex_dn=round(gex_dn, 4), d_cap=d_cap,
             c_oi=c_oi, p_oi=p_oi, c_vol=c_vol, p_vol=p_vol,
-            # Драбина — по НЕзгрупованих страйках: бакет показує зону,
-            # а рівень треба назвати точно.
             call_walls=[{"s": r["strike"], "oi": r["call_oi"]}
-                        for r in sorted(raw, key=lambda r: r["call_oi"], reverse=True)[:3]],
+                        for r in sorted(rows, key=lambda r: r["call_oi"], reverse=True)[:3]],
             put_walls=[{"s": r["strike"], "oi": r["put_oi"]}
-                       for r in sorted(raw, key=lambda r: r["put_oi"], reverse=True)[:3]],
+                       for r in sorted(rows, key=lambda r: r["put_oi"], reverse=True)[:3]],
             d_state=d_state, d_note=d_note,
             delta_call=d_call, delta_put=d_put,
         ))
@@ -879,6 +761,29 @@ function xRange(m){
   return [lo, hi];
 }
 
+/* Видимий зріз ціни словами: «видно 24 100 – 24 900 (±1.6 %)». */
+function spanTxt(m){
+  var s = m.slist || [];
+  if(s.length < 2) return '';
+  var r = xRange(m);
+  var a = s[Math.max(0, Math.round(r[0] + 0.5))];
+  var b = s[Math.min(s.length - 1, Math.round(r[1]))];
+  if(a === undefined || b === undefined || b <= a) return '';
+  var out = '  ·  видно ' + num(a) + ' – ' + num(b);
+  if(m.center_num) out += '  (±' + (100 * (b - a) / 2 / m.center_num).toFixed(1) + ' %)';
+  return out;
+}
+
+/* Позначки під віссю — від ширини вікна: на зумі їх має ставати
+   не густіше, інакше підписи налазять один на одного. */
+function ticksFor(m){
+  var s = m.slist || [], r = xRange(m);
+  var every = Math.max(1, Math.round((r[1] - r[0]) / 12));
+  var tv = [];
+  for(var i = 0; i < s.length; i += every) tv.push(num(s[i]));
+  return tv;
+}
+
 var KEYS = {
   oi:    [['Calls','var(--ash)'], ['Puts','var(--chalk)']],
   vol:   [['Calls','var(--ash)'], ['Puts','var(--chalk)']],
@@ -945,8 +850,8 @@ function render(){
       shapes: m.shapes,
       annotations: m.annotations,
       'xaxis.range': xRange(m),
-      'xaxis.tickvals': m.tickvals,
-      'xaxis.ticktext': m.ticktext,
+      'xaxis.tickvals': ticksFor(m),
+      'xaxis.ticktext': ticksFor(m),
       'yaxis.range': yRange(m),
       'yaxis.autorange': false,
       'yaxis.title.text': yTitle()
@@ -1000,16 +905,13 @@ function render(){
 
   var note = document.getElementById('note');
   if(curMode === 'delta'){
-    var dn = m.d_note;
-    /* Дельта теж зведена по смугах — масштаб бара треба назвати й тут. */
-    if(m.d_state === 'ok' && m.step_txt) dn += '  ·  ' + m.step_txt;
-    note.textContent = dn;
+    note.textContent = m.d_note;
     note.className = 'note' + (m.d_state === 'ok' ? '' : ' warn');
   } else {
     var base = NOTES[curMode] || '';
-    /* Масштаб бара треба назвати: інакше сума в бакеті читається
-       як OI одного страйка. */
-    if(curMode !== 'heat' && m.step_txt) base += '  ·  ' + m.step_txt;
+    /* Який шматок ціни зараз на екрані. Оновлюється на зумі, тож
+       видно, скільки дає кожне натискання −/+. */
+    if(curMode !== 'heat') base += spanTxt(m);
     note.textContent = base;
     note.className = 'note';
   }
@@ -1067,8 +969,9 @@ def build_html(series):
     for i, s in enumerate(series):
         s["base"] = i * TRACES_PER_SERIES
 
-    fig  = build_figure(series)
-    meta = build_meta(series)
+    cats = _categories(series)
+    fig  = build_figure(series, cats)
+    meta = build_meta(series, cats)
 
     cfg = {"scrollZoom": True, "displayModeBar": True, "displaylogo": False,
            "modeBarButtonsToRemove": ["select2d", "lasso2d", "toggleSpikelines"]}
@@ -1173,20 +1076,15 @@ def main():
         und     = a.get("futures_px") or a.get("underlying")
         mp      = a.get("max_pain")
         center  = und or mp
-        raw     = _window(d["strikes"], center)
-        # Групуємо в бакети природного кроку сітки: інакше видно
-        # діапазон близько ±1.5 % — надто близько, щоб читати.
-        step    = _auto_step([r["strike"] for r in raw], center)
-        rows    = _bucket(raw, step, prev_lookup.get(d["expiry"], {}), center)
+        rows    = _window(d["strikes"], center)
         strikes = [r["strike"] for r in rows]
-        gexb    = _bucket_gex(d.get("gex_data") or [], step, set(strikes))
 
         series.append(dict(
             expiry=d["expiry"], contract_type=d["contract_type"],
-            rows=rows, strikes=strikes, raw=raw, step=step,
-            gex=gexb,
+            rows=rows, strikes=strikes,
+            gex=d.get("gex_data") or [],
             spot=und, max_pain=mp, pcr=a.get("pcr"),
-            center=center, view=_view_range(strikes, center, step),
+            center=center, view=_view_range(strikes, center),
             prev=prev_lookup.get(d["expiry"], {}),
             prev_label=prev_label,
             stamp=stamp,
